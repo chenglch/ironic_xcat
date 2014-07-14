@@ -59,7 +59,7 @@ CONF.import_opt('min_command_interval',
 
 LOG = logging.getLogger(__name__)
 
-VALID_BOOT_DEVICES = ['net', 'hd', 'cd', 'floppy']
+VALID_BOOT_DEVICES = ['net', 'hd', 'cd', 'floppy', 'def', 'stat']
 VALID_PRIV_LEVELS = ['ADMINISTRATOR', 'CALLBACK', 'OPERATOR', 'USER']
 LAST_CMD_TIME = {}
 TIMING_SUPPORT = None
@@ -158,12 +158,14 @@ def _parse_driver_info(node):
             'priv_level': priv_level,
             'xcat_node': xcat_node
            }
-def define_node(driver_info):
+def chdef_node(driver_info):
     cmd = 'chdef'
-    args = '-o' +\
-            ' bmc=' + driver_info['address'] +\
-            ' bmcusername=' + driver_info['username'] +\
-            ' bmcpassword=' + driver_info['password'];
+    args = 'mgt=ipmi' + \
+           ' bmc=' + driver_info['address'] + \
+           ' bmcusername=' + driver_info['username'] + \
+           ' bmcpassword=' + driver_info['password'] + \
+           ' serialport=' + driver_info['port'];
+
     try:
         out_err = _exec_xcatcmd(driver_info, cmd, args)
     except Exception as e:
@@ -301,9 +303,9 @@ def _power_status(driver_info):
                     % {'node_id': driver_info['uuid'], 'error': e})
         raise exception.IPMIFailure(cmd=cmd)
 
-    if out_err[0].split(' ') == "on":
+    if out_err[0].split(' ')[1].strip() == "on":
         return states.POWER_ON
-    elif out_err[0].split(' ') == "off":
+    elif out_err[0].split(' ')[1].strip() == "off":
         return states.POWER_OFF
     else:
         return states.ERROR
@@ -332,7 +334,7 @@ class XcatPower(base.PowerInterface):
 
         """
         driver_info = _parse_driver_info(task.node)
-        define_node(driver_info)
+        chdef_node(driver_info)
 
     def get_power_state(self, task):
         """Get the current power state of the task's node.
@@ -428,7 +430,7 @@ class VendorPassthru(base.VendorInterface):
                 "Unsupported method (%s) passed to xcat driver.")
                 % method)
         driver_info = _parse_driver_info(task.node)
-        define_node(driver_info)
+        chdef_node(driver_info)
 
     def vendor_passthru(self, task, **kwargs):
         method = kwargs['method']
@@ -448,8 +450,8 @@ class IPMIShellinaboxConsole(base.ConsoleInterface):
         except OSError:
             raise exception.DriverLoadError(
                     driver=self.__class__.__name__,
-                    reason="Unable to locate usable ipmitool command in "
-                           "the system path when checking ipmitool version")
+                    reason="Unable to locate usable xcat command in "
+                           "the system path when checking xcat version")
 
     def validate(self, task):
         """Validate the Node console info.
@@ -458,6 +460,9 @@ class IPMIShellinaboxConsole(base.ConsoleInterface):
         :raises: InvalidParameterValue
         """
         driver_info = _parse_driver_info(task.node)
+        if not driver_info['xcat_node']:
+            raise exception.InvalidParameterValue(_(
+                "xcat node name not supplied to xcat baremetal driver."))
         if not driver_info['port']:
             raise exception.InvalidParameterValue(_(
                 "IPMI terminal port not supplied to IPMI driver."))
