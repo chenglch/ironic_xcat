@@ -126,6 +126,13 @@ class NeutronAPI(object):
                            ), port_id)
             raise exception.FailedToUpdateMacOnPort(port_id=port_id)
 
+    def get_vif_port_info(self, port_id):
+        try:
+            port_info = self.client.show_port(port_id)
+        except neutron_client_exc.NeutronClientException:
+            LOG.exception(_("Failed to get port info %s."), port_id)
+            raise exception.FailedToUpdateDHCPOptOnPort(port_id=port_id)
+        return port_info
 
 def get_node_vif_ids(task):
     """Get all Neutron VIF ids for a node.
@@ -143,6 +150,22 @@ def get_node_vif_ids(task):
             port_vifs[port.uuid] = vif
     return port_vifs
 
+def get_ports_info_from_neutron(task):
+    vifs = get_node_vif_ids(task)
+    if not vifs:
+        LOG.warning(_("No VIFs found for node %(node)s when attempting to "
+                      "update Neutron DHCP BOOT options."),
+                      {'node': task.node.uuid})
+        return
+    api = NeutronAPI(task.context)
+    failures = []
+    vif_ports_info = {}
+    for port_id, port_vif in vifs.iteritems():
+        try:
+            vif_ports_info[port_id] = api.get_vif_port_info(port_vif)
+        except exception.FailedToUpdateDHCPOptOnPort:
+            failures.append(port_id)
+    return vif_ports_info
 
 def update_neutron(task, pxe_bootfile_name):
     """Send or update the DHCP BOOT options to Neutron for this node."""

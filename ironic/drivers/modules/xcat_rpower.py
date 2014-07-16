@@ -125,6 +125,8 @@ def _parse_driver_info(node):
     port = info.get('ipmi_terminal_port')
     priv_level = info.get('ipmi_priv_level', 'ADMINISTRATOR')
     xcat_node = info.get('xcat_node')
+    xcatmaster = info.get('xcatmaster')
+    netboot = info.get('netboot')
 
     if port:
         try:
@@ -156,7 +158,9 @@ def _parse_driver_info(node):
             'port': port,
             'uuid': node.uuid,
             'priv_level': priv_level,
-            'xcat_node': xcat_node
+            'xcat_node': xcat_node,
+            'xcatmaster': xcatmaster,
+            'netboot': netboot
            }
 def chdef_node(driver_info):
     cmd = 'chdef'
@@ -164,7 +168,9 @@ def chdef_node(driver_info):
            ' bmc=' + driver_info['address'] + \
            ' bmcusername=' + driver_info['username'] + \
            ' bmcpassword=' + driver_info['password'] + \
-           ' serialport=' + driver_info['port'];
+           ' xcatmaster='  + driver_info['xcatmaster']+ \
+           ' netboot=' + driver_info['netboot']+ \
+           ' serialport=' + str(driver_info['port']);
 
     try:
         out_err = _exec_xcatcmd(driver_info, cmd, args)

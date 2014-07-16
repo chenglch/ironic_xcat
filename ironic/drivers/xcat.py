@@ -22,6 +22,7 @@ from ironic.drivers import base
 from ironic.drivers.modules import ipminative
 from ironic.drivers.modules import ipmitool
 from ironic.drivers.modules import pxe
+from ironic.drivers.modules import xcat_pxe
 from ironic.drivers.modules import seamicro
 from ironic.drivers.modules import ssh
 from ironic.drivers import utils
@@ -39,7 +40,7 @@ class XCATBaremetalDriver(base.BaseDriver):
     def __init__(self):
         self.power = xcat_rpower.XcatPower()
         self.console = ipmitool.IPMIShellinaboxConsole()
-        self.deploy = pxe.PXEDeploy()
+        self.deploy = xcat_pxe.PXEDeploy()
         self.pxe_vendor = pxe.VendorPassthru()
         self.ipmi_vendor = ipmitool.VendorPassthru()
         self.mapping = {'pass_deploy_info': self.pxe_vendor,
