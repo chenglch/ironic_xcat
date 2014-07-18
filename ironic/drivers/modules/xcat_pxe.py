@@ -18,7 +18,7 @@ PXE Driver and supporting meta-classes.
 """
 
 import os
-
+import time
 from oslo.config import cfg
 
 from ironic.common import exception
@@ -83,6 +83,7 @@ CONF = cfg.CONF
 CONF.register_opts(pxe_opts, group='pxe')
 CONF.import_opt('use_ipv6', 'ironic.netconf')
 
+LAST_CMD_TIME = {}
 
 def _check_for_missing_params(info_dict, param_prefix=''):
     missing_info = []
@@ -108,11 +109,7 @@ def _parse_driver_info(node):
     """
     info = node.driver_info
     d_info = {}
-    d_info['deploy_kernel'] = info.get('pxe_deploy_kernel')
-    d_info['deploy_ramdisk'] = info.get('pxe_deploy_ramdisk')
-
-    _check_for_missing_params(d_info, 'pxe_')
-
+    d_info['xcat_node'] = info.get('xcat_node')
     return d_info
 
 
@@ -131,6 +128,7 @@ def _parse_instance_info(node):
     i_info = {}
     i_info['image_source'] = info.get('image_source')
     i_info['root_gb'] = info.get('root_gb')
+    i_info['image_file'] = i_info['image_source']
 
     _check_for_missing_params(i_info)
 
@@ -234,6 +232,22 @@ def _get_token_file_path(node_uuid):
     """Generate the path for PKI token file."""
     return os.path.join(CONF.tftp.tftp_root, 'token-' + node_uuid)
 
+def _exec_xcatcmd(driver_info, command, args):
+    cmd = [command,
+            driver_info['xcat_node']
+            ]
+    cmd.extend(args.split(" "))
+        # NOTE(deva): ensure that no communications are sent to a BMC more
+        #             often than once every min_command_interval seconds.
+    time_till_next_poll = CONF.ipmi.min_command_interval - (
+                time.time() - LAST_CMD_TIME.get(driver_info['xcat_node'], 0))
+    if time_till_next_poll > 0:
+        time.sleep(time_till_next_poll)
+    try:
+        out, err = utils.execute(*cmd)
+    finally:
+        LAST_CMD_TIME[driver_info['xcat_node']] = time.time()
+    return out, err
 
 class PXEImageCache(image_cache.ImageCache):
     def __init__(self, master_dir, image_service=None):
@@ -318,6 +332,18 @@ def _cache_tftp_images(ctx, node, pxe_info):
     LOG.debug("Fetching kernel and ramdisk for node %s",
               node.uuid)
     _fetch_images(ctx, TFTPImageCache(), pxe_info.values())
+
+def _tsplit(string, delimiters):
+        """Behaves str.split but supports multiple delimiters."""
+        delimiters = tuple(delimiters)
+        stack = [string,]
+        for delimiter in delimiters:
+            for i, substring in enumerate(stack):
+                substack = substring.split(delimiter)
+                stack.pop(i)
+                for j, _substring in enumerate(substack):
+                    stack.insert(i+j, _substring)
+        return stack
 
 
 def _cache_instance_image(ctx, node):
@@ -432,30 +458,8 @@ def _validate_glance_image(ctx, deploy_info):
     :raises: InvalidParameterValue.
     """
     image_id = deploy_info['image_source']
-    try:
-        glance_service = service.Service(version=1, context=ctx)
-        image_props = glance_service.show(image_id)['properties']
-    except (exception.GlanceConnectionFailed,
-            exception.ImageNotAuthorized,
-            exception.Invalid):
-        raise exception.InvalidParameterValue(_(
-            "Failed to connect to Glance to get the properties "
-            "of the image %s") % image_id)
-    except exception.ImageNotFound:
-        raise exception.InvalidParameterValue(_(
-            "Image %s not found in Glance") % image_id)
-
-    missing_props = []
-    for prop in ('kernel_id', 'ramdisk_id'):
-        if not image_props.get(prop):
-            missing_props.append(prop)
-
-    if missing_props:
-        props = ', '.join(missing_props)
-        raise exception.InvalidParameterValue(_(
-            "Image %(image)s is missing the following properties: "
-            "%(properties)s") % {'image': image_id, 'properties': props})
-
+    if not image_id:
+        raise exception.ImageNotFound
 
 class PXEDeploy(base.DeployInterface):
     """PXE Deploy Interface: just a stub until the real driver is ported."""
@@ -472,7 +476,6 @@ class PXEDeploy(base.DeployInterface):
                                 "any port associated with it.") % node.uuid)
 
         d_info = _parse_deploy_info(node)
-
         # Try to get the URL of the Ironic API
         try:
             # TODO(lucasagomes): Validate the format of the URL
@@ -500,13 +503,12 @@ class PXEDeploy(base.DeployInterface):
         :param task: a TaskManager instance containing the node to act on.
         :returns: deploy state DEPLOYING.
         """
-        _cache_instance_image(task.context, task.node)
-        _check_image_size(task)
-
-        # TODO(yuriyz): more secure way needed for pass auth token
-        #               to deploy ramdisk
-        _create_token_file(task)
-        neutron.update_neutron(task, CONF.pxe.pxe_bootfile_name)
+        import pdb
+        pdb.set_trace()
+        d_info = _parse_deploy_info(task.node)
+        pxe_file_path = "/tftpboot/xcat/xnba/nodes/" + d_info['xcat_node']+ ".uefi"
+        nbp_file = "xcat/xnba.efi"
+        neutron.update_neutron(task, nbp_file)
         manager_utils.node_set_boot_device(task, 'pxe', persistent=True)
         manager_utils.node_power_action(task, states.REBOOT)
 
@@ -535,11 +537,34 @@ class PXEDeploy(base.DeployInterface):
         :param task: a TaskManager instance containing the node to act on.
         """
         # TODO(deva): optimize this if rerun on existing files
-        pxe_info = _get_tftp_image_info(task.node, task.context)
-        pxe_options = _build_pxe_config_options(task.node, pxe_info,
-                                                task.context)
-        tftp.create_pxe_config(task, pxe_options, CONF.pxe.pxe_config_template)
-        _cache_tftp_images(task.context, task.node, pxe_info)
+        d_info = _parse_deploy_info(task.node)
+        image_id = d_info['image_source']
+        image_name = None
+        try:
+            glance_service = service.Service(version=1, context=task.context)
+            image_name = glance_service.show(image_id)['name']
+        except (exception.GlanceConnectionFailed,
+                exception.ImageNotAuthorized,
+                exception.Invalid):
+            raise exception.InvalidParameterValue(_(
+                "Failed to connect to Glance to get the properties "
+                "of the image %s") % image_id)
+
+        node_mac_addrsses = driver_utils.get_node_mac_addresses(task)
+        vif_ports_info = neutron.get_ports_info_from_neutron(task)
+        deploy_ip, deploy_mac_address = self._get_deploy_ip_mac(vif_ports_info, node_mac_addrsses)
+        import pdb
+        pdb.set_trace()
+        LOG.info(_('Continuing deployment for node %(node)s, deploy_fix_ip %(ip)s,'
+                   'deploy_mac %(mac)s') % {'node': task.node.uuid, 'ip':deploy_ip, 'mac':deploy_mac_address })
+
+
+        self._chdef_node_mac_address(d_info,deploy_mac_address)
+        self._config_host_file(d_info,deploy_ip)
+        self._make_dhcp()
+        #self._nodeset_osimage(d_info,image_name)
+        #self._stop_dhcp()
+
 
     def clean_up(self, task):
         """Clean up the deployment environment for the task's node.
@@ -550,22 +575,73 @@ class PXEDeploy(base.DeployInterface):
 
         :param task: a TaskManager instance containing the node to act on.
         """
-        node = task.node
-        pxe_info = _get_tftp_image_info(node, task.context)
-        d_info = _parse_deploy_info(node)
-        for label in pxe_info:
-            path = pxe_info[label][1]
-            utils.unlink_without_raise(path)
-        TFTPImageCache().clean_up()
-
-        tftp.clean_up_pxe_config(task)
-
-        _destroy_images(d_info, node.uuid)
-        _destroy_token_file(node)
+        pass
 
     def take_over(self, task):
         neutron.update_neutron(task, CONF.pxe.pxe_bootfile_name)
 
+    def _get_deploy_ip_mac(self, vif_ports_info, valid_node_mac_addrsses):
+
+        for port_info in vif_ports_info.values():
+            if(port_info['port']['mac_address'] in valid_node_mac_addrsses ):
+                return port_info['port']['fixed_ips'][0]['ip_address'], port_info['port']['mac_address']
+        return None, None
+
+    def _chdef_node_mac_address(self, driver_info, deploy_mac):
+        cmd = 'chdef'
+        args = 'mac='+ deploy_mac
+        try:
+            out_err = _exec_xcatcmd(driver_info, cmd, args)
+        except Exception as e:
+            LOG.warning(_("xcat chdef failed for node %(xcat_node)s with "
+                        "error: %(error)s.")
+                        % {'xcat_node': driver_info['xcat_node'], 'error': e})
+            raise exception.IPMIFailure(cmd=cmd)
+
+    def _config_host_file(self, driver_info, deploy_ip):
+        hosts_file = open('/etc/hosts', "r")
+        lines = []
+
+        for line in hosts_file:
+            temp = line.split('#')
+            if temp[0].strip():
+                host_name = _tsplit(temp[0].strip(),(' ','\t'))[1]
+                if( host_name is not None):
+                    if( host_name != driver_info['xcat_node']):
+                        lines.append(line)
+
+        line = "%s\t%s\n" %(deploy_ip,driver_info['xcat_node'])
+        lines.append(line)
+        hosts_file.close()
+        hosts_file = open('/etc/hosts', "w")
+        for line in lines:
+            hosts_file.write(line)
+        hosts_file.close()
+
+    def _nodeset_osimage(self, driver_info, image_name):
+        cmd = 'nodeset'
+        args = 'osimage='+ image_name
+        try:
+            out_err = _exec_xcatcmd(driver_info, cmd, args)
+        except Exception as e:
+            LOG.warning(_("xcat chdef failed for node %(xcat_node)s with "
+                        "error: %(error)s.")
+                        % {'xcat_node': driver_info['xcat_node'], 'error': e})
+            raise exception.IPMIFailure(cmd=cmd)
+
+    def _make_dhcp(self):
+        cmd = ['makedhcp',
+            '-n'
+            ]
+
+        try:
+            out, err = utils.execute(*cmd)
+        finally:
+            pass
+        return out, err
+
+    def _stop_dhcp(self):
+        os.system("/etc/init.d/isc-dhcp-server stop")
 
 class VendorPassthru(base.VendorInterface):
     """Interface to mix IPMI and PXE vendor-specific interfaces."""
