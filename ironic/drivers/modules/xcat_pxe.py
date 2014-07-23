@@ -550,18 +550,23 @@ class PXEDeploy(base.DeployInterface):
                 "Failed to connect to Glance to get the properties "
                 "of the image %s") % image_id)
 
-        node_mac_addrsses = driver_utils.get_node_mac_addresses(task)
-        vif_ports_info = neutron.get_ports_info_from_neutron(task)
-        deploy_ip, deploy_mac_address = self._get_deploy_ip_mac(vif_ports_info, node_mac_addrsses)
         import pdb
         pdb.set_trace()
+        node_mac_addrsses = driver_utils.get_node_mac_addresses(task)
+        vif_ports_info = neutron.get_ports_info_from_neutron(task)
+        network_info = self._get_deploy_network_info(vif_ports_info, node_mac_addrsses)
+        if not network_info:
+            raise exception.Invalid
+        deploy_ip = network_info['fixed_ip_address']
+        deploy_mac_address = network_info['max_address']
+        network_id = network_info['network_id']
+
         LOG.info(_('Continuing deployment for node %(node)s, deploy_fix_ip %(ip)s,'
                    'deploy_mac %(mac)s') % {'node': task.node.uuid, 'ip':deploy_ip, 'mac':deploy_mac_address })
 
-
         self._chdef_node_mac_address(d_info,deploy_mac_address)
         self._config_host_file(d_info,deploy_ip)
-        self._make_dhcp()
+        #self._make_dhcp()
         #self._nodeset_osimage(d_info,image_name)
         #self._stop_dhcp()
 
@@ -580,12 +585,15 @@ class PXEDeploy(base.DeployInterface):
     def take_over(self, task):
         neutron.update_neutron(task, CONF.pxe.pxe_bootfile_name)
 
-    def _get_deploy_ip_mac(self, vif_ports_info, valid_node_mac_addrsses):
-
+    def _get_deploy_network_info(self, vif_ports_info, valid_node_mac_addrsses):
+        network_info = {}
         for port_info in vif_ports_info.values():
             if(port_info['port']['mac_address'] in valid_node_mac_addrsses ):
-                return port_info['port']['fixed_ips'][0]['ip_address'], port_info['port']['mac_address']
-        return None, None
+                network_info['fixed_ip_address'] = port_info['port']['fixed_ips'][0]['ip_address']
+                network_info['max_address'] = port_info['port']['mac_address']
+                network_info['network_id'] = port_info['port']['network_id']
+                return network_info
+        return network_info
 
     def _chdef_node_mac_address(self, driver_info, deploy_mac):
         cmd = 'chdef'
@@ -628,6 +636,7 @@ class PXEDeploy(base.DeployInterface):
                         "error: %(error)s.")
                         % {'xcat_node': driver_info['xcat_node'], 'error': e})
             raise exception.IPMIFailure(cmd=cmd)
+
 
     def _make_dhcp(self):
         cmd = ['makedhcp',
