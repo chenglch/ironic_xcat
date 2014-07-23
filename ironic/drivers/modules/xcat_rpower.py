@@ -170,6 +170,10 @@ def chdef_node(driver_info):
            ' bmcpassword=' + driver_info['password'] + \
            ' xcatmaster='  + driver_info['xcatmaster']+ \
            ' netboot=' + driver_info['netboot']+ \
+           ' primarynic=mac'+ \
+           ' installnic=mac'+ \
+           ' monserver=' + driver_info['xcatmaster'] + \
+           ' nfsserver=' + driver_info['xcatmaster'] + \
            ' serialflow=hard'+ \
            ' serialspeed=115200' + \
            ' serialport=' + str(driver_info['port']);

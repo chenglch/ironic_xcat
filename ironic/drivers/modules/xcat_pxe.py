@@ -19,13 +19,13 @@ PXE Driver and supporting meta-classes.
 
 import os
 import time
+import paramiko
 from oslo.config import cfg
 
 from ironic.common import exception
 from ironic.common import image_service as service
 from ironic.common import images
 from ironic.common import keystone
-from ironic.common import neutron
 from ironic.common import paths
 from ironic.common import states
 from ironic.common import tftp
@@ -39,6 +39,8 @@ from ironic.drivers import utils as driver_utils
 from ironic.openstack.common import fileutils
 from ironic.openstack.common import log as logging
 from ironic.openstack.common import strutils
+from ironic.drivers.modules import xcat_neutron
+
 
 
 pxe_opts = [
@@ -248,6 +250,23 @@ def _exec_xcatcmd(driver_info, command, args):
     finally:
         LAST_CMD_TIME[driver_info['xcat_node']] = time.time()
     return out, err
+
+def xcat_ssh2(ip,username,passwd,cmd):
+    try:
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.connect(ip,22,username,passwd,timeout=5)
+        for m in cmd:
+            stdin, stdout, stderr = ssh.exec_command(m)
+#           stdin.write("Y")   #....... .Y.
+            out = stdout.readlines()
+            #....
+            for o in out:
+                print o,
+        print '%s\tOK\n'%(ip)
+        ssh.close()
+    except :
+        print '%s\tError\n'%(ip)
 
 class PXEImageCache(image_cache.ImageCache):
     def __init__(self, master_dir, image_service=None):
@@ -503,12 +522,13 @@ class PXEDeploy(base.DeployInterface):
         :param task: a TaskManager instance containing the node to act on.
         :returns: deploy state DEPLOYING.
         """
-        import pdb
-        pdb.set_trace()
+
         d_info = _parse_deploy_info(task.node)
         pxe_file_path = "/tftpboot/xcat/xnba/nodes/" + d_info['xcat_node']+ ".uefi"
         nbp_file = "xcat/xnba.efi"
-        neutron.update_neutron(task, nbp_file)
+        import pdb
+        pdb.set_trace()
+        xcat_neutron.update_neutron(task, nbp_file)
         manager_utils.node_set_boot_device(task, 'pxe', persistent=True)
         manager_utils.node_power_action(task, states.REBOOT)
 
@@ -553,21 +573,23 @@ class PXEDeploy(base.DeployInterface):
         import pdb
         pdb.set_trace()
         node_mac_addrsses = driver_utils.get_node_mac_addresses(task)
-        vif_ports_info = neutron.get_ports_info_from_neutron(task)
+        vif_ports_info = xcat_neutron.get_ports_info_from_neutron(task)
         network_info = self._get_deploy_network_info(vif_ports_info, node_mac_addrsses)
         if not network_info:
             raise exception.Invalid
         deploy_ip = network_info['fixed_ip_address']
         deploy_mac_address = network_info['max_address']
         network_id = network_info['network_id']
-
+        port_id = network_info['port_id']
+        #api = xcat_neutron.NeutronAPI(task.context)
+        #api.update_port_address(port_id,'fa:16:3e:a0:fa:40')
         LOG.info(_('Continuing deployment for node %(node)s, deploy_fix_ip %(ip)s,'
                    'deploy_mac %(mac)s') % {'node': task.node.uuid, 'ip':deploy_ip, 'mac':deploy_mac_address })
 
         self._chdef_node_mac_address(d_info,deploy_mac_address)
         self._config_host_file(d_info,deploy_ip)
-        #self._make_dhcp()
-        #self._nodeset_osimage(d_info,image_name)
+        self._make_dhcp()
+        self._nodeset_osimage(d_info,image_name)
         #self._stop_dhcp()
 
 
@@ -583,7 +605,7 @@ class PXEDeploy(base.DeployInterface):
         pass
 
     def take_over(self, task):
-        neutron.update_neutron(task, CONF.pxe.pxe_bootfile_name)
+        xcat_neutron.update_neutron(task, CONF.pxe.pxe_bootfile_name)
 
     def _get_deploy_network_info(self, vif_ports_info, valid_node_mac_addrsses):
         network_info = {}
@@ -592,6 +614,7 @@ class PXEDeploy(base.DeployInterface):
                 network_info['fixed_ip_address'] = port_info['port']['fixed_ips'][0]['ip_address']
                 network_info['max_address'] = port_info['port']['mac_address']
                 network_info['network_id'] = port_info['port']['network_id']
+                network_info['port_id'] = port_info['port']['id']
                 return network_info
         return network_info
 
@@ -639,16 +662,28 @@ class PXEDeploy(base.DeployInterface):
 
 
     def _make_dhcp(self):
+        # makedhcp -n
         cmd = ['makedhcp',
             '-n'
             ]
-
         try:
             out, err = utils.execute(*cmd)
-        finally:
-            pass
-        return out, err
-
+            LOG.info(_(" excute cmd: %(cmd)s \n output: %(out)s \n. Error: %(err)s \n"),
+                      {'cmd':cmd,'out': out, 'err': err})
+        except Exception as e:
+            LOG.error(_("Unable to execute %(cmd)s. Exception: %(exception)s"),
+                      {'cmd': cmd, 'exception': e})
+        # makedhcp -a
+        cmd = ['makedhcp',
+            '-a'
+            ]
+        try:
+            out, err = utils.execute(*cmd)
+            LOG.info(_(" excute cmd: %(cmd)s \n output: %(out)s \n. Error: %(err)s \n"),
+                      {'cmd':cmd,'out': out, 'err': err})
+        except Exception as e:
+            LOG.error(_("Unable to execute %(cmd)s. Exception: %(exception)s"),
+                      {'cmd': cmd, 'exception': e})
     def _stop_dhcp(self):
         os.system("/etc/init.d/isc-dhcp-server stop")
 
