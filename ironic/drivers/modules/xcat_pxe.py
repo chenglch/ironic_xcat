@@ -40,8 +40,7 @@ from ironic.openstack.common import fileutils
 from ironic.openstack.common import log as logging
 from ironic.openstack.common import strutils
 from ironic.drivers.modules import xcat_neutron
-
-
+from ironic.drivers.modules import xcat_util
 
 pxe_opts = [
     cfg.StrOpt('pxe_append_params',
@@ -78,11 +77,42 @@ pxe_opts = [
                default=60,
                help='Maximum TTL (in minutes) for old master images in cache'),
     ]
+xcat_opts = [
+    cfg.StrOpt('network_node_ip',
+               default='127.0.0.1',
+               help='IP address of neutron network node'),
+    cfg.StrOpt('ssh_user',
+               default='root',
+               help='Username of neutron network node.'),
+    cfg.StrOpt('ssh_password',
+               default='cluster',
+               help='Password of neutron network node'),
+    cfg.IntOpt('ssh_login_wait',
+               default=3,
+               help='Sleep time of ssh login'),
+    cfg.IntOpt('ssh_session_timeout',
+               default=10,
+               help='ssh session time'),
+    cfg.IntOpt('ssh_shell_wait',
+               default=1,
+               help='wait time for the ssh cmd excute'),
+    cfg.IntOpt('ssh_port',
+               default=22,
+               help='ssh connection port for the neutron '),
+    cfg.IntOpt('ssh_buf_size',
+               default=65535,
+               help='Maximum size (in charactor) of cache for ssh, '
+               'including those in use'),
+    cfg.StrOpt('host_filepath',
+               default='/etc/hosts',
+               help='host file of server'),
+    ]
 
 LOG = logging.getLogger(__name__)
 
 CONF = cfg.CONF
 CONF.register_opts(pxe_opts, group='pxe')
+CONF.register_opts(xcat_opts, group='xcat')
 CONF.import_opt('use_ipv6', 'ironic.netconf')
 
 LAST_CMD_TIME = {}
@@ -251,23 +281,6 @@ def _exec_xcatcmd(driver_info, command, args):
         LAST_CMD_TIME[driver_info['xcat_node']] = time.time()
     return out, err
 
-def xcat_ssh2(ip,username,passwd,cmd):
-    try:
-        ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ssh.connect(ip,22,username,passwd,timeout=5)
-        for m in cmd:
-            stdin, stdout, stderr = ssh.exec_command(m)
-#           stdin.write("Y")   #....... .Y.
-            out = stdout.readlines()
-            #....
-            for o in out:
-                print o,
-        print '%s\tOK\n'%(ip)
-        ssh.close()
-    except :
-        print '%s\tError\n'%(ip)
-
 class PXEImageCache(image_cache.ImageCache):
     def __init__(self, master_dir, image_service=None):
         super(PXEImageCache, self).__init__(
@@ -351,18 +364,6 @@ def _cache_tftp_images(ctx, node, pxe_info):
     LOG.debug("Fetching kernel and ramdisk for node %s",
               node.uuid)
     _fetch_images(ctx, TFTPImageCache(), pxe_info.values())
-
-def _tsplit(string, delimiters):
-        """Behaves str.split but supports multiple delimiters."""
-        delimiters = tuple(delimiters)
-        stack = [string,]
-        for delimiter in delimiters:
-            for i, substring in enumerate(stack):
-                substack = substring.split(delimiter)
-                stack.pop(i)
-                for j, _substring in enumerate(substack):
-                    stack.insert(i+j, _substring)
-        return stack
 
 
 def _cache_instance_image(ctx, node):
@@ -524,14 +525,13 @@ class PXEDeploy(base.DeployInterface):
         """
 
         d_info = _parse_deploy_info(task.node)
-        pxe_file_path = "/tftpboot/xcat/xnba/nodes/" + d_info['xcat_node']+ ".uefi"
-        nbp_file = "xcat/xnba.efi"
-        import pdb
-        pdb.set_trace()
-        xcat_neutron.update_neutron(task, nbp_file)
+        if not task.node.instance_info.get('fixed_ip_address') or not task.node.instance_info.get('image_name'):
+            raise exception.InvalidParameterValue
+        self._config_host_file(d_info,task.node.instance_info.get('fixed_ip_address'))
+        self._make_dhcp()
+        self._nodeset_osimage(d_info,task.node.instance_info.get('image_name'))
         manager_utils.node_set_boot_device(task, 'pxe', persistent=True)
         manager_utils.node_power_action(task, states.REBOOT)
-
         return states.DEPLOYWAIT
 
     @task_manager.require_exclusive_lock
@@ -558,11 +558,12 @@ class PXEDeploy(base.DeployInterface):
         """
         # TODO(deva): optimize this if rerun on existing files
         d_info = _parse_deploy_info(task.node)
+        i_info = task.node.instance_info
         image_id = d_info['image_source']
-        image_name = None
         try:
             glance_service = service.Service(version=1, context=task.context)
             image_name = glance_service.show(image_id)['name']
+            i_info['image_name'] = image_name
         except (exception.GlanceConnectionFailed,
                 exception.ImageNotAuthorized,
                 exception.Invalid):
@@ -570,28 +571,25 @@ class PXEDeploy(base.DeployInterface):
                 "Failed to connect to Glance to get the properties "
                 "of the image %s") % image_id)
 
-        import pdb
-        pdb.set_trace()
         node_mac_addrsses = driver_utils.get_node_mac_addresses(task)
         vif_ports_info = xcat_neutron.get_ports_info_from_neutron(task)
         network_info = self._get_deploy_network_info(vif_ports_info, node_mac_addrsses)
         if not network_info:
             raise exception.Invalid
-        deploy_ip = network_info['fixed_ip_address']
+        fixed_ip_address = network_info['fixed_ip_address']
         deploy_mac_address = network_info['max_address']
         network_id = network_info['network_id']
         port_id = network_info['port_id']
-        #api = xcat_neutron.NeutronAPI(task.context)
-        #api.update_port_address(port_id,'fa:16:3e:a0:fa:40')
-        LOG.info(_('Continuing deployment for node %(node)s, deploy_fix_ip %(ip)s,'
-                   'deploy_mac %(mac)s') % {'node': task.node.uuid, 'ip':deploy_ip, 'mac':deploy_mac_address })
+        import pdb
+        pdb.set_trace()
 
+        i_info['fixed_ip_address'] = fixed_ip_address
+        task.node.instance_info = i_info
+
+        # iptables to drop the dhcp mac of baremetal machine
+        self._ssh_iptables_dhcp_rule(CONF.xcat.network_node_ip,CONF.xcat.ssh_port,CONF.xcat.ssh_user,
+                                     CONF.xcat.ssh_password,network_id,deploy_mac_address)
         self._chdef_node_mac_address(d_info,deploy_mac_address)
-        self._config_host_file(d_info,deploy_ip)
-        self._make_dhcp()
-        self._nodeset_osimage(d_info,image_name)
-        #self._stop_dhcp()
-
 
     def clean_up(self, task):
         """Clean up the deployment environment for the task's node.
@@ -605,7 +603,7 @@ class PXEDeploy(base.DeployInterface):
         pass
 
     def take_over(self, task):
-        xcat_neutron.update_neutron(task, CONF.pxe.pxe_bootfile_name)
+        pass
 
     def _get_deploy_network_info(self, vif_ports_info, valid_node_mac_addrsses):
         network_info = {}
@@ -623,6 +621,7 @@ class PXEDeploy(base.DeployInterface):
         args = 'mac='+ deploy_mac
         try:
             out_err = _exec_xcatcmd(driver_info, cmd, args)
+            LOG.info(_("xcat chdef cmd exetute output: %(out_err)s") % {'out_err':out_err})
         except Exception as e:
             LOG.warning(_("xcat chdef failed for node %(xcat_node)s with "
                         "error: %(error)s.")
@@ -630,24 +629,22 @@ class PXEDeploy(base.DeployInterface):
             raise exception.IPMIFailure(cmd=cmd)
 
     def _config_host_file(self, driver_info, deploy_ip):
-        hosts_file = open('/etc/hosts', "r")
-        lines = []
-
-        for line in hosts_file:
-            temp = line.split('#')
-            if temp[0].strip():
-                host_name = _tsplit(temp[0].strip(),(' ','\t'))[1]
-                if( host_name is not None):
-                    if( host_name != driver_info['xcat_node']):
+        with open(CONF.xcat.host_filepath,"r") as f:
+            lines = []
+            for line in f:
+                temp = line.split('#')
+                if temp[0].strip():
+                    host_name = xcat_util._tsplit(temp[0].strip(),(' ','\t'))[1]
+                    if host_name != driver_info['xcat_node']:
                         lines.append(line)
 
-        line = "%s\t%s\n" %(deploy_ip,driver_info['xcat_node'])
-        lines.append(line)
-        hosts_file.close()
-        hosts_file = open('/etc/hosts', "w")
-        for line in lines:
-            hosts_file.write(line)
-        hosts_file.close()
+            line = "%s\t%s\n" %(deploy_ip,driver_info['xcat_node'])
+            lines.append(line)
+
+        with open(CONF.xcat.host_filepath,"w") as f:
+            for line in lines:
+                f.write(line)
+
 
     def _nodeset_osimage(self, driver_info, image_name):
         cmd = 'nodeset'
@@ -686,6 +683,15 @@ class PXEDeploy(base.DeployInterface):
                       {'cmd': cmd, 'exception': e})
     def _stop_dhcp(self):
         os.system("/etc/init.d/isc-dhcp-server stop")
+
+    def _ssh_iptables_dhcp_rule(self,ip,port,username,password,network_id,mac_address):
+        netns = 'qdhcp-%s' %network_id
+        cancel_cmd = 'sudo ip netns exec %s iptables -D INPUT -m mac --mac-source %s -j DROP' % \
+               (netns,mac_address)
+        append_cmd = 'sudo ip netns exec %s iptables -A INPUT -m mac --mac-source %s -j DROP' % \
+               (netns,mac_address)
+        cmd = [cancel_cmd,append_cmd]
+        xcat_util.xcat_ssh(ip,port,username,password,cmd)
 
 class VendorPassthru(base.VendorInterface):
     """Interface to mix IPMI and PXE vendor-specific interfaces."""
