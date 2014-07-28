@@ -20,8 +20,8 @@ PXE Driver and supporting meta-classes.
 import os
 import time
 import paramiko
+import datetime
 from oslo.config import cfg
-
 from ironic.common import exception
 from ironic.common import image_service as service
 from ironic.common import images
@@ -41,6 +41,13 @@ from ironic.openstack.common import log as logging
 from ironic.openstack.common import strutils
 from ironic.drivers.modules import xcat_neutron
 from ironic.drivers.modules import xcat_util
+
+from ironic.openstack.common import loopingcall
+
+from nova.openstack.common import timeutils
+
+from ironic.drivers.modules import xcat_exception
+
 
 pxe_opts = [
     cfg.StrOpt('pxe_append_params',
@@ -103,6 +110,12 @@ xcat_opts = [
     cfg.StrOpt('host_filepath',
                default='/etc/hosts',
                help='host file of server'),
+    cfg.IntOpt('deploy_timeout',
+               default=3600,
+               help='max depolyment time(seconds) for the xcat driver'),
+    cfg.IntOpt('deploy_checking_interval',
+               default=30,
+               help='interval time(seconds) to check the xcat deploy state'),
     ]
 
 LOG = logging.getLogger(__name__)
@@ -206,24 +219,6 @@ def _parse_deploy_info(node):
     info.update(_parse_driver_info(node))
     return info
 
-def _exec_xcatcmd(driver_info, command, args):
-    cmd = [command,
-            driver_info['xcat_node']
-            ]
-    cmd.extend(args.split(" "))
-        # NOTE(deva): ensure that no communications are sent to a BMC more
-        #             often than once every min_command_interval seconds.
-    time_till_next_poll = CONF.ipmi.min_command_interval - (
-                time.time() - LAST_CMD_TIME.get(driver_info['xcat_node'], 0))
-    if time_till_next_poll > 0:
-        time.sleep(time_till_next_poll)
-    try:
-        out, err = utils.execute(*cmd)
-    finally:
-        LAST_CMD_TIME[driver_info['xcat_node']] = time.time()
-    return out, err
-
-
 def _validate_glance_image(ctx, deploy_info):
     """Validate the image in Glance.
 
@@ -286,8 +281,17 @@ class PXEDeploy(base.DeployInterface):
         self._make_dhcp()
         self._nodeset_osimage(d_info,task.node.instance_info.get('image_name'))
         manager_utils.node_set_boot_device(task, 'pxe', persistent=True)
+        import pdb
+        pdb.set_trace()
         manager_utils.node_power_action(task, states.REBOOT)
-        return states.DEPLOYWAIT
+
+        self._wait_for_node_deploy(task)
+        """
+        except xcat_exception.xCATDeploymentFailure:
+            LOG.info(_("xcat deployment failed"))
+            return states.ERROR
+        """
+        return states.DEPLOYDONE
 
     @task_manager.require_exclusive_lock
     def tear_down(self, task):
@@ -335,14 +339,14 @@ class PXEDeploy(base.DeployInterface):
         deploy_mac_address = network_info['max_address']
         network_id = network_info['network_id']
         port_id = network_info['port_id']
-        import pdb
-        pdb.set_trace()
 
         i_info['fixed_ip_address'] = fixed_ip_address
-        task.node.instance_info = i_info
+        i_info['network_id'] = network_id
+        i_info['deploy_mac_address'] = deploy_mac_address
+        #task.node.instance_info = i_info
 
         # iptables to drop the dhcp mac of baremetal machine
-        self._ssh_iptables_dhcp_rule(CONF.xcat.network_node_ip,CONF.xcat.ssh_port,CONF.xcat.ssh_user,
+        self._ssh_append_dhcp_rule(CONF.xcat.network_node_ip,CONF.xcat.ssh_port,CONF.xcat.ssh_user,
                                      CONF.xcat.ssh_password,network_id,deploy_mac_address)
         self._chdef_node_mac_address(d_info,deploy_mac_address)
 
@@ -375,9 +379,9 @@ class PXEDeploy(base.DeployInterface):
         cmd = 'chdef'
         args = 'mac='+ deploy_mac
         try:
-            out_err = _exec_xcatcmd(driver_info, cmd, args)
+            out_err = xcat_util.exec_xcatcmd(driver_info, cmd, args)
             LOG.info(_("xcat chdef cmd exetute output: %(out_err)s") % {'out_err':out_err})
-        except Exception as e:
+        except xcat_exception.xCATCmdFailure as e:
             LOG.warning(_("xcat chdef failed for node %(xcat_node)s with "
                         "error: %(error)s.")
                         % {'xcat_node': driver_info['xcat_node'], 'error': e})
@@ -405,13 +409,11 @@ class PXEDeploy(base.DeployInterface):
         cmd = 'nodeset'
         args = 'osimage='+ image_name
         try:
-            out_err = _exec_xcatcmd(driver_info, cmd, args)
-        except Exception as e:
-            LOG.warning(_("xcat chdef failed for node %(xcat_node)s with "
+            out_err = xcat_util.exec_xcatcmd(driver_info, cmd, args)
+        except xcat_exception.xCATCmdFailure as e:
+            LOG.warning(_("xcat nodeset failed for node %(xcat_node)s with "
                         "error: %(error)s.")
                         % {'xcat_node': driver_info['xcat_node'], 'error': e})
-            raise exception.IPMIFailure(cmd=cmd)
-
 
     def _make_dhcp(self):
         # makedhcp -n
@@ -437,11 +439,61 @@ class PXEDeploy(base.DeployInterface):
             LOG.error(_("Unable to execute %(cmd)s. Exception: %(exception)s"),
                       {'cmd': cmd, 'exception': e})
 
-    def _ssh_iptables_dhcp_rule(self,ip,port,username,password,network_id,mac_address):
+    def _ssh_append_dhcp_rule(self,ip,port,username,password,network_id,mac_address):
+        netns = 'qdhcp-%s' %network_id
+
+        append_cmd = 'sudo ip netns exec %s iptables -A INPUT -m mac --mac-source %s -j DROP' % \
+               (netns,mac_address)
+        cmd = [append_cmd]
+        xcat_util.xcat_ssh(ip,port,username,password,cmd)
+
+    def _ssh_delete_dhcp_rule(self,ip,port,username,password,network_id,mac_address):
         netns = 'qdhcp-%s' %network_id
         cancel_cmd = 'sudo ip netns exec %s iptables -D INPUT -m mac --mac-source %s -j DROP' % \
                (netns,mac_address)
-        append_cmd = 'sudo ip netns exec %s iptables -A INPUT -m mac --mac-source %s -j DROP' % \
-               (netns,mac_address)
-        cmd = [cancel_cmd,append_cmd]
+        cmd = [cancel_cmd]
         xcat_util.xcat_ssh(ip,port,username,password,cmd)
+
+    def _wait_for_node_deploy(self, task):
+
+        locals = {'errstr':''}
+        driver_info = _parse_deploy_info(task.node)
+        node_mac_addrsses = driver_utils.get_node_mac_addresses(task)
+        i_info = task.node.instance_info
+
+        def _wait_for_deploy():
+            out,err = xcat_util.exec_xcatcmd(driver_info,'nodels','nodelist.status')
+            if err:
+                locals['errstr'] = _("Error returned when quering node status"
+                           " for node %s:%s") % (driver_info['xcat_node'], err)
+                LOG.warning(locals['errstr'])
+                raise loopingcall.LoopingCallDone()
+
+            if out:
+                node,status = out.split(": ")
+                status = status.strip()
+                if status == "booted":
+                    LOG.info(_("Deployment for node %s completed.")
+                             % driver_info['xcat_node'])
+                    raise loopingcall.LoopingCallDone()
+
+            if (CONF.xcat.deploy_timeout and
+                    timeutils.utcnow() > expiration):
+                locals['errstr'] = _("Timeout while waiting for"
+                           " deployment of node %s.") % driver_info['xcat_node']
+                LOG.warning(locals['errstr'])
+                raise loopingcall.LoopingCallDone()
+
+        expiration = timeutils.utcnow() + datetime.timedelta(
+                seconds=CONF.xcat.deploy_timeout)
+        timer = loopingcall.FixedIntervalLoopingCall(_wait_for_deploy)
+        # default check every 10 seconds
+        timer.start(interval=CONF.xcat.deploy_checking_interval).wait()
+
+        if locals['errstr']:
+            raise xcat_exception.xCATDeploymentFailure(locals['errstr'])
+
+        self._ssh_delete_iptables_rule(CONF.xcat.network_node_ip,CONF.xcat.ssh_port,CONF.xcat.ssh_user,
+                                     CONF.xcat.ssh_password,i_info['network_id'],node_mac_addrsses)
+
+

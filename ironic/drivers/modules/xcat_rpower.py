@@ -47,7 +47,8 @@ from ironic.openstack.common import excutils
 from ironic.openstack.common import log as logging
 from ironic.openstack.common import loopingcall
 from ironic.openstack.common import processutils
-
+from ironic.drivers.modules import xcat_exception
+from ironic.drivers.modules import xcat_util
 
 CONF = cfg.CONF
 CONF.import_opt('retry_timeout',
@@ -61,7 +62,6 @@ LOG = logging.getLogger(__name__)
 
 VALID_BOOT_DEVICES = ['net', 'hd', 'cd', 'floppy', 'def', 'stat']
 VALID_PRIV_LEVELS = ['ADMINISTRATOR', 'CALLBACK', 'OPERATOR', 'USER']
-LAST_CMD_TIME = {}
 TIMING_SUPPORT = None
 
 
@@ -179,29 +179,11 @@ def chdef_node(driver_info):
            ' serialport=' + str(driver_info['port']);
 
     try:
-        out_err = _exec_xcatcmd(driver_info, cmd, args)
-    except Exception as e:
+        out_err = xcat_util.exec_xcatcmd(driver_info, cmd, args)
+    except xcat_exception.xCATCmdFailure as e:
         LOG.warning(_("xcat chdef failed for node %(node_id)s with "
                     "error: %(error)s.")
                     % {'node_id': driver_info['uuid'], 'error': e})
-        raise exception.IPMIFailure(cmd=cmd)
-
-def _exec_xcatcmd(driver_info, command, args):
-    cmd = [command,
-            driver_info['xcat_node']
-            ]
-    cmd.extend(args.split(" "))
-        # NOTE(deva): ensure that no communications are sent to a BMC more
-        #             often than once every min_command_interval seconds.
-    time_till_next_poll = CONF.ipmi.min_command_interval - (
-                time.time() - LAST_CMD_TIME.get(driver_info['address'], 0))
-    if time_till_next_poll > 0:
-        time.sleep(time_till_next_poll)
-    try:
-        out, err = utils.execute(*cmd)
-    finally:
-        LAST_CMD_TIME[driver_info['address']] = time.time()
-    return out, err
 
 def _sleep_time(iter):
     """Return the time-to-sleep for the n'th iteration of a retry loop.
@@ -243,7 +225,7 @@ def _set_and_wait(target_state, driver_info):
         try:
             # Only issue power change command once
             if mutable['iter'] < 0:
-                _exec_xcatcmd(driver_info,'rpower',state_name)
+                xcat_util.exec_xcatcmd(driver_info,'rpower',state_name)
             else:
                 mutable['power'] = _power_status(driver_info)
         except Exception:
@@ -308,12 +290,11 @@ def _power_status(driver_info):
     """
     cmd = "rpower"
     try:
-        out_err = _exec_xcatcmd(driver_info,cmd,'status')
+        out_err = xcat_util.exec_xcatcmd(driver_info,cmd,'status')
     except Exception as e:
         LOG.warning(_("xcat rpower status failed for node %(node_id)s with "
                       "error: %(error)s.")
                     % {'node_id': driver_info['uuid'], 'error': e})
-        raise exception.IPMIFailure(cmd=cmd)
 
     if out_err[0].split(' ')[1].strip() == "on":
         return states.POWER_ON
@@ -346,7 +327,10 @@ class XcatPower(base.PowerInterface):
 
         """
         driver_info = _parse_driver_info(task.node)
-        chdef_node(driver_info)
+        try:
+            chdef_node(driver_info)
+        except exception:
+            LOG.error(_("chdef xcat info error!"))
 
     def get_power_state(self, task):
         """Get the current power state of the task's node.
@@ -425,10 +409,12 @@ class VendorPassthru(base.VendorInterface):
             cmd = cmd + " options=persistent"
         driver_info = _parse_driver_info(task.node)
         try:
-            out_err = _exec_xcatcmd(driver_info, cmd, device)
+            out_err = xcat_util.exec_xcatcmd(driver_info, cmd, device)
             # TODO(deva): validate (out, err) and add unit test for failure
-        except Exception:
-            raise exception.IPMIFailure(cmd=cmd)
+        except xcat_exception.xCATCmdFailure:
+            LOG.error(_("rsetboot %(node)s %(device)s"),{'node':driver_info['xcat_node]'],
+                                                         'device':device})
+
 
     def validate(self, task, **kwargs):
         method = kwargs['method']
