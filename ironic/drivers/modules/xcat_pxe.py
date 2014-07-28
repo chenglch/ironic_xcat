@@ -138,7 +138,6 @@ def _check_for_missing_params(info_dict, param_prefix=''):
                 "Can not validate PXE bootloader. The following parameters "
                 "were not passed to ironic: %s") % missing_info)
 
-
 def _parse_driver_info(node):
     """Gets the driver specific Node deployment info.
 
@@ -153,7 +152,6 @@ def _parse_driver_info(node):
     d_info = {}
     d_info['xcat_node'] = info.get('xcat_node')
     return d_info
-
 
 def _parse_instance_info(node):
     """Gets the instance specific Node deployment info.
@@ -271,7 +269,7 @@ class PXEDeploy(base.DeployInterface):
         VendorPassthru._continue_deploy().
 
         :param task: a TaskManager instance containing the node to act on.
-        :returns: deploy state DEPLOYING.
+        :returns: deploy state DEPLOYDONE.
         """
 
         d_info = _parse_deploy_info(task.node)
@@ -284,13 +282,12 @@ class PXEDeploy(base.DeployInterface):
         import pdb
         pdb.set_trace()
         manager_utils.node_power_action(task, states.REBOOT)
-
-        self._wait_for_node_deploy(task)
-        """
+        try:
+            self._wait_for_node_deploy(task)
         except xcat_exception.xCATDeploymentFailure:
             LOG.info(_("xcat deployment failed"))
             return states.ERROR
-        """
+
         return states.DEPLOYDONE
 
     @task_manager.require_exclusive_lock
@@ -308,11 +305,7 @@ class PXEDeploy(base.DeployInterface):
 
     def prepare(self, task):
         """Prepare the deployment environment for this task's node.
-
-        Generates the TFTP configuration for PXE-booting both the deployment
-        and user images, fetches the TFTP image from Glance and add it to the
-        local cache.
-
+        Config the dhcp with xcat command
         :param task: a TaskManager instance containing the node to act on.
         """
         # TODO(deva): optimize this if rerun on existing files
@@ -326,26 +319,29 @@ class PXEDeploy(base.DeployInterface):
         except (exception.GlanceConnectionFailed,
                 exception.ImageNotAuthorized,
                 exception.Invalid):
-            raise exception.InvalidParameterValue(_(
-                "Failed to connect to Glance to get the properties "
+            LOG.warning(_("Failed to connect to Glance to get the properties "
                 "of the image %s") % image_id)
 
-        node_mac_addrsses = driver_utils.get_node_mac_addresses(task)
+        node_mac_addresses = driver_utils.get_node_mac_addresses(task)
         vif_ports_info = xcat_neutron.get_ports_info_from_neutron(task)
-        network_info = self._get_deploy_network_info(vif_ports_info, node_mac_addrsses)
+        try:
+            network_info = self._get_deploy_network_info(vif_ports_info, node_mac_addresses)
+        except (xcat_exception.GetNetworkFixedIPFailure,xcat_exception.GetNetworkIdFailure):
+            LOG.error(_("Failed to get network info"))
+            return
         if not network_info:
-            raise exception.Invalid
+            LOG.error(_("Failed to get network info"))
+            return
+
         fixed_ip_address = network_info['fixed_ip_address']
-        deploy_mac_address = network_info['max_address']
+        deploy_mac_address = network_info['mac_address']
         network_id = network_info['network_id']
-        port_id = network_info['port_id']
 
         i_info['fixed_ip_address'] = fixed_ip_address
         i_info['network_id'] = network_id
         i_info['deploy_mac_address'] = deploy_mac_address
-        #task.node.instance_info = i_info
 
-        # iptables to drop the dhcp mac of baremetal machine
+        # use iptables to drop the dhcp mac of baremetal machine
         self._ssh_append_dhcp_rule(CONF.xcat.network_node_ip,CONF.xcat.ssh_port,CONF.xcat.ssh_user,
                                      CONF.xcat.ssh_password,network_id,deploy_mac_address)
         self._chdef_node_mac_address(d_info,deploy_mac_address)
@@ -365,17 +361,28 @@ class PXEDeploy(base.DeployInterface):
         pass
 
     def _get_deploy_network_info(self, vif_ports_info, valid_node_mac_addrsses):
+        """Get network info from mac address of ironic node.
+        :param vif_ports_info: info collection from neutron ports
+        :param valid_node_mac_addrsses: mac address from ironic node
+        :raises: GetNetworkFixedIpFailure if search the fixed ip from mac address failure
+        :raises: GetNetworkIdFailure if search the network id from mac address failure
+        """
         network_info = {}
         for port_info in vif_ports_info.values():
             if(port_info['port']['mac_address'] in valid_node_mac_addrsses ):
                 network_info['fixed_ip_address'] = port_info['port']['fixed_ips'][0]['ip_address']
-                network_info['max_address'] = port_info['port']['mac_address']
+                if not network_info['fixed_ip_address']:
+                    raise xcat_exception.GetNetworkFixedIPFailure(mac_address=port_info['port']['mac_address'])
+                network_info['mac_address'] = port_info['port']['mac_address']
                 network_info['network_id'] = port_info['port']['network_id']
+                if not network_info['network_id']:
+                    raise xcat_exception.GetNetworkIdFailure(mac_address=port_info['port']['mac_address'])
                 network_info['port_id'] = port_info['port']['id']
                 return network_info
         return network_info
 
     def _chdef_node_mac_address(self, driver_info, deploy_mac):
+        """ run chdef command to set mac address"""
         cmd = 'chdef'
         args = 'mac='+ deploy_mac
         try:
@@ -388,15 +395,17 @@ class PXEDeploy(base.DeployInterface):
             raise exception.IPMIFailure(cmd=cmd)
 
     def _config_host_file(self, driver_info, deploy_ip):
+        """ append node and ip infomation to host file"""
         with open(CONF.xcat.host_filepath,"r") as f:
             lines = []
             for line in f:
                 temp = line.split('#')
                 if temp[0].strip():
                     host_name = xcat_util._tsplit(temp[0].strip(),(' ','\t'))[1]
-                    if host_name != driver_info['xcat_node']:
+                    if driver_info['xcat_node'] not in host_name:
                         lines.append(line)
 
+            # append a new line to host file
             line = "%s\t%s\n" %(deploy_ip,driver_info['xcat_node'])
             lines.append(line)
 
@@ -406,17 +415,21 @@ class PXEDeploy(base.DeployInterface):
 
 
     def _nodeset_osimage(self, driver_info, image_name):
+        """run nodeset command to config the image for the xcat node
+        :param driver_info: xcat node deploy info
+        :param image_name: image for the xcat deployment
+        """
         cmd = 'nodeset'
         args = 'osimage='+ image_name
         try:
-            out_err = xcat_util.exec_xcatcmd(driver_info, cmd, args)
+            xcat_util.exec_xcatcmd(driver_info, cmd, args)
         except xcat_exception.xCATCmdFailure as e:
             LOG.warning(_("xcat nodeset failed for node %(xcat_node)s with "
                         "error: %(error)s.")
                         % {'xcat_node': driver_info['xcat_node'], 'error': e})
 
     def _make_dhcp(self):
-        # makedhcp -n
+        """run makedhcp command to setup dhcp environment for the xcat node"""
         cmd = ['makedhcp',
             '-n'
             ]
@@ -440,14 +453,15 @@ class PXEDeploy(base.DeployInterface):
                       {'cmd': cmd, 'exception': e})
 
     def _ssh_append_dhcp_rule(self,ip,port,username,password,network_id,mac_address):
+        """ drop the dhcp package in network node to avoid of confilct of dhcp """
         netns = 'qdhcp-%s' %network_id
-
         append_cmd = 'sudo ip netns exec %s iptables -A INPUT -m mac --mac-source %s -j DROP' % \
                (netns,mac_address)
         cmd = [append_cmd]
         xcat_util.xcat_ssh(ip,port,username,password,cmd)
 
     def _ssh_delete_dhcp_rule(self,ip,port,username,password,network_id,mac_address):
+        """ delete the iptable rule on network node to recover the environment"""
         netns = 'qdhcp-%s' %network_id
         cancel_cmd = 'sudo ip netns exec %s iptables -D INPUT -m mac --mac-source %s -j DROP' % \
                (netns,mac_address)
@@ -455,7 +469,7 @@ class PXEDeploy(base.DeployInterface):
         xcat_util.xcat_ssh(ip,port,username,password,cmd)
 
     def _wait_for_node_deploy(self, task):
-
+        """Wait for xCAT node deployment to complete."""
         locals = {'errstr':''}
         driver_info = _parse_deploy_info(task.node)
         node_mac_addrsses = driver_utils.get_node_mac_addresses(task)
@@ -490,10 +504,12 @@ class PXEDeploy(base.DeployInterface):
         # default check every 10 seconds
         timer.start(interval=CONF.xcat.deploy_checking_interval).wait()
 
+        import pdb
+        pdb.set_trace()
         if locals['errstr']:
             raise xcat_exception.xCATDeploymentFailure(locals['errstr'])
 
-        self._ssh_delete_iptables_rule(CONF.xcat.network_node_ip,CONF.xcat.ssh_port,CONF.xcat.ssh_user,
+        self._ssh_delete_dhcp_rule(CONF.xcat.network_node_ip,CONF.xcat.ssh_port,CONF.xcat.ssh_user,
                                      CONF.xcat.ssh_password,i_info['network_id'],node_mac_addrsses)
 
 

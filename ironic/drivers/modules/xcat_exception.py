@@ -14,3 +14,12 @@ class xCATCmdFailure(IronicException):
 
 class xCATDeploymentFailure(IronicException):
     message = _("xCAT node deployment failed for node %(node)s:%(error)s")
+
+class GetNetworkFixedIPFailure(IronicException):
+    message = _("get fixed ip failed for mac %(mac_address)s")
+
+class GetNetworkIdFailure(IronicException):
+    message = _("get node network in failed for mac %(mac_address)s")
+
+class FailedToGetInfoOnPort(IronicException):
+    message = _("Show info on port: %(port_id)s failed.")

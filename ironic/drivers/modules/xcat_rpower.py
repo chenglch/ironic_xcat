@@ -150,6 +150,13 @@ def _parse_driver_info(node):
         raise exception.InvalidParameterValue(_(
             "xcat node name not supplied to xcat driver"))
 
+    if not xcatmaster:
+        raise exception.InvalidParameterValue(_(
+            "xcatmaster not supplied to xcat driver"))
+
+    if not netboot:
+        raise exception.InvalidParameterValue(_(
+            "netboot not supplied to xcat driver"))
 
     return {
             'address': address,
@@ -163,6 +170,9 @@ def _parse_driver_info(node):
             'netboot': netboot
            }
 def chdef_node(driver_info):
+    """Run the chdef command in xcat, config the node
+    :param driver_info: driver_info for the xcat node
+    """
     cmd = 'chdef'
     args = 'mgt=ipmi' + \
            ' bmc=' + driver_info['address'] + \
@@ -179,7 +189,7 @@ def chdef_node(driver_info):
            ' serialport=' + str(driver_info['port']);
 
     try:
-        out_err = xcat_util.exec_xcatcmd(driver_info, cmd, args)
+        xcat_util.exec_xcatcmd(driver_info, cmd, args)
     except xcat_exception.xCATCmdFailure as e:
         LOG.warning(_("xcat chdef failed for node %(node_id)s with "
                     "error: %(error)s.")
@@ -262,7 +272,7 @@ def _set_and_wait(target_state, driver_info):
 def _power_on(driver_info):
     """Turn the power ON for this node.
 
-    :param driver_info: the ipmitool parameters for accessing a node.
+    :param driver_info: the xcat parameters for accessing a node.
     :returns: one of ironic.common.states POWER_ON or ERROR.
     :raises: IPMIFailure on an error from ipmitool (from _power_status call).
 
@@ -273,7 +283,7 @@ def _power_on(driver_info):
 def _power_off(driver_info):
     """Turn the power OFF for this node.
 
-    :param driver_info: the ipmitool parameters for accessing a node.
+    :param driver_info: the xcat parameters for accessing a node.
     :returns: one of ironic.common.states POWER_OFF or ERROR.
     :raises: IPMIFailure on an error from ipmitool (from _power_status call).
 
@@ -283,7 +293,7 @@ def _power_off(driver_info):
 def _power_status(driver_info):
     """Get the power status for a node.
 
-    :param driver_info: the ipmitool access parameters for a node.
+    :param driver_info: the xcat access parameters for a node.
     :returns: one of ironic.common.states POWER_OFF, POWER_ON or ERROR.
     :raises: IPMIFailure on an error from ipmitool.
 
@@ -315,10 +325,8 @@ class XcatPower(base.PowerInterface):
                     reason="Unable to locate usable xcat command in "
                            "the system path when checking xcat version")
 
-
-
     def validate(self, task):
-        """Validate driver_info for ipmitool driver.
+        """Validate driver_info for xcat driver.
 
         Check that node['driver_info'] contains IPMI credentials.
 
@@ -337,9 +345,6 @@ class XcatPower(base.PowerInterface):
 
         :param task: a TaskManager instance containing the node to act on.
         :returns: one of ironic.common.states POWER_OFF, POWER_ON or ERROR.
-        :raises: InvalidParameterValue if required ipmi parameters are missing.
-        :raises: IPMIFailure on an error from ipmitool (from _power_status
-            call).
 
         """
         driver_info = _parse_driver_info(task.node)
@@ -366,7 +371,6 @@ class XcatPower(base.PowerInterface):
         else:
             raise exception.InvalidParameterValue(_("set_power_state called "
                     "with invalid power state %s.") % pstate)
-
         if state != pstate:
             raise exception.PowerStateFailure(pstate=pstate)
 
@@ -393,7 +397,7 @@ class VendorPassthru(base.VendorInterface):
         """Set the boot device for a node.
 
         :param task: a TaskManager instance.
-        :param device: Boot device. One of [pxe, disk, cdrom, safe, bios].
+        :param device: Boot device. One of [net, hd, cd, floppy, def, stat].
         :param persistent: Whether to set next-boot, or make the change
             permanent. Default: False.
         :raises: InvalidParameterValue if an invalid boot device is specified
@@ -409,7 +413,7 @@ class VendorPassthru(base.VendorInterface):
             cmd = cmd + " options=persistent"
         driver_info = _parse_driver_info(task.node)
         try:
-            out_err = xcat_util.exec_xcatcmd(driver_info, cmd, device)
+            xcat_util.exec_xcatcmd(driver_info, cmd, device)
             # TODO(deva): validate (out, err) and add unit test for failure
         except xcat_exception.xCATCmdFailure:
             LOG.error(_("rsetboot %(node)s %(device)s"),{'node':driver_info['xcat_node]'],
@@ -417,6 +421,7 @@ class VendorPassthru(base.VendorInterface):
 
 
     def validate(self, task, **kwargs):
+        """ run chdef command to config xcat node infomation """
         method = kwargs['method']
         if method == 'set_boot_device':
             device = kwargs.get('device')

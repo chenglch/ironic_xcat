@@ -8,7 +8,6 @@ from oslo.config import cfg
 from ironic.drivers.modules import xcat_exception
 from ironic.common import utils
 
-
 xcat_opts = [
     cfg.StrOpt('network_node_ip',
                default='127.0.0.1',
@@ -49,6 +48,7 @@ CONF.register_opts(xcat_opts, group='xcat')
 LAST_CMD_TIME = {}
 
 def xcat_ssh(ip,port,username,password,cmd):
+    """ exec remote command with ssh  """
     key =None
     if CONF.xcat.ssh_key:
         try:
@@ -74,6 +74,7 @@ def xcat_ssh(ip,port,username,password,cmd):
         _xcat_ssh_exec(chan,c,password)
 
 def _xcat_ssh_exec(chan,cmd,password):
+    """ exec ssh command """
     chan.send(cmd + '\n')
     time.sleep(CONF.xcat.ssh_shell_wait)
     ret = chan.recv(CONF.xcat.ssh_buf_size)
@@ -85,18 +86,19 @@ def _xcat_ssh_exec(chan,cmd,password):
     return output
 
 def _tsplit(string, delimiters):
-        """Behaves str.split but supports multiple delimiters."""
-        delimiters = tuple(delimiters)
-        stack = [string,]
-        for delimiter in delimiters:
-            for i, substring in enumerate(stack):
-                substack = substring.split(delimiter)
-                stack.pop(i)
-                for j, _substring in enumerate(substack):
-                    stack.insert(i+j, _substring)
-        return stack
+    """ Behaves str.split but supports multiple delimiters. """
+    delimiters = tuple(delimiters)
+    stack = [string,]
+    for delimiter in delimiters:
+        for i, substring in enumerate(stack):
+            substack = substring.split(delimiter)
+            stack.pop(i)
+            for j, _substring in enumerate(substack):
+                stack.insert(i+j, _substring)
+    return stack
 
 def exec_xcatcmd(driver_info, command, args):
+    """ excute xcat cmd """
     cmd = [command,
             driver_info['xcat_node']
             ]
