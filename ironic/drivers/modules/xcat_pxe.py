@@ -279,8 +279,6 @@ class PXEDeploy(base.DeployInterface):
         self._make_dhcp()
         self._nodeset_osimage(d_info,task.node.instance_info.get('image_name'))
         manager_utils.node_set_boot_device(task, 'pxe', persistent=True)
-        import pdb
-        pdb.set_trace()
         manager_utils.node_power_action(task, states.REBOOT)
         try:
             self._wait_for_node_deploy(task)
@@ -504,12 +502,10 @@ class PXEDeploy(base.DeployInterface):
         # default check every 10 seconds
         timer.start(interval=CONF.xcat.deploy_checking_interval).wait()
 
-        import pdb
-        pdb.set_trace()
         if locals['errstr']:
             raise xcat_exception.xCATDeploymentFailure(locals['errstr'])
 
         self._ssh_delete_dhcp_rule(CONF.xcat.network_node_ip,CONF.xcat.ssh_port,CONF.xcat.ssh_user,
-                                     CONF.xcat.ssh_password,i_info['network_id'],node_mac_addrsses)
+                                     CONF.xcat.ssh_password,i_info['network_id'],node_mac_addrsses[0])
 
 
