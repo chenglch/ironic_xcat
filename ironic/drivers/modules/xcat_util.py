@@ -1,5 +1,8 @@
-__author__ = 'chenglong'
-
+"""
+util for xcat baremetal driver
+exec_xcatcmd
+xcat_ssh  to excute remote cmd
+"""
 import paramiko
 import time
 import socket
@@ -9,24 +12,12 @@ from ironic.drivers.modules import xcat_exception
 from ironic.common import utils
 
 xcat_opts = [
-    cfg.StrOpt('network_node_ip',
-               default='127.0.0.1',
-               help='IP address of neutron network node'),
-    cfg.StrOpt('ssh_user',
-               default='root',
-               help='Username of neutron network node.'),
-    cfg.StrOpt('ssh_password',
-               default='cluster',
-               help='Password of neutron network node'),
     cfg.IntOpt('ssh_session_timeout',
                default=10,
                help='ssh session time'),
     cfg.FloatOpt('ssh_shell_wait',
                default=0.5,
                help='wait time for the ssh cmd excute'),
-    cfg.IntOpt('ssh_port',
-               default=22,
-               help='ssh connection port for the neutron '),
     cfg.IntOpt('ssh_buf_size',
                default=65535,
                help='Maximum size (in charactor) of cache for ssh, '
@@ -103,7 +94,7 @@ def exec_xcatcmd(driver_info, command, args):
             driver_info['xcat_node']
             ]
     cmd.extend(args.split(" "))
-        # NOTE(deva): ensure that no communications are sent to a BMC more
+        # NOTE: ensure that no communications are excuted more
         #             often than once every min_command_interval seconds.
     time_till_next_poll = CONF.ipmi.min_command_interval - (
                 time.time() - LAST_CMD_TIME.get(driver_info['xcat_node'], 0))

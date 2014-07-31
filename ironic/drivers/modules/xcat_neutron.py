@@ -1,18 +1,7 @@
-#
-# Copyright 2014 OpenStack Foundation
-# All Rights Reserved
-#
-#    Licensed under the Apache License, Version 2.0 (the "License"); you may
-#    not use this file except in compliance with the License. You may obtain
-#    a copy of the License at
-#
-#         http://www.apache.org/licenses/LICENSE-2.0
-#
-#    Unless required by applicable law or agreed to in writing, software
-#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
-#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-#    License for the specific language governing permissions and limitations
-#    under the License.
+"""
+Get the network from neutron
+This is a xcat patch for the ironic/common/neutron.py
+"""
 
 from neutronclient.common import exceptions as neutron_client_exc
 from ironic.common import exception
@@ -23,6 +12,7 @@ from ironic.drivers.modules import xcat_exception
 LOG = logging.getLogger(__name__)
 
 def get_vif_port_info(task, port_id):
+    """ Get  detail port info from neutron with a given port id """
     api = neutron.NeutronAPI(task.context)
     try:
         port_info = api.client.show_port(port_id)
@@ -33,6 +23,7 @@ def get_vif_port_info(task, port_id):
 
 
 def get_ports_info_from_neutron(task):
+    """  Get neutron port info from neutron about this task """
     vifs = neutron.get_node_vif_ids(task)
     if not vifs:
         LOG.warning(_("No VIFs found for node %(node)s when attempting to "

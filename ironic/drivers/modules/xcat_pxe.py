@@ -1,20 +1,6 @@
-# -*- encoding: utf-8 -*-
-#
-# Copyright 2013 Hewlett-Packard Development Company, L.P.
-#
-# Licensed under the Apache License, Version 2.0 (the "License"); you may
-# not use this file except in compliance with the License. You may obtain
-# a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
-# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-# License for the specific language governing permissions and limitations
-# under the License.
 """
-PXE Driver and supporting meta-classes.
+pxe procedure for the xcat baremetal driver
+use xcat to config dhcp and tftp
 """
 
 import os
@@ -24,28 +10,20 @@ import datetime
 from oslo.config import cfg
 from ironic.common import exception
 from ironic.common import image_service as service
-from ironic.common import images
 from ironic.common import keystone
-from ironic.common import paths
 from ironic.common import states
-from ironic.common import tftp
 from ironic.common import utils
 from ironic.conductor import task_manager
 from ironic.conductor import utils as manager_utils
 from ironic.drivers import base
-from ironic.drivers.modules import deploy_utils
-from ironic.drivers.modules import image_cache
 from ironic.drivers import utils as driver_utils
-from ironic.openstack.common import fileutils
 from ironic.openstack.common import log as logging
 from ironic.openstack.common import strutils
 from ironic.drivers.modules import xcat_neutron
 from ironic.drivers.modules import xcat_util
-
 from ironic.openstack.common import loopingcall
-
 from nova.openstack.common import timeutils
-
+from ironic.openstack.common import lockutils
 from ironic.drivers.modules import xcat_exception
 
 
@@ -53,36 +31,10 @@ pxe_opts = [
     cfg.StrOpt('pxe_append_params',
                default='nofb nomodeset vga=normal',
                help='Additional append parameters for baremetal PXE boot.'),
-    cfg.StrOpt('pxe_config_template',
-               default=paths.basedir_def(
-                    'drivers/modules/pxe_config.template'),
-               help='Template file for PXE configuration.'),
     cfg.StrOpt('default_ephemeral_format',
                default='ext4',
                help='Default file system format for ephemeral partition, '
                     'if one is created.'),
-    cfg.StrOpt('images_path',
-               default='/var/lib/ironic/images/',
-               help='Directory where images are stored on disk.'),
-    cfg.StrOpt('tftp_master_path',
-               default='/tftpboot/master_images',
-               help='Directory where master tftp images are stored on disk.'),
-    cfg.StrOpt('instance_master_path',
-               default='/var/lib/ironic/master_images',
-               help='Directory where master instance images are stored on '
-                    'disk.'),
-    # NOTE(dekehn): Additional boot files options may be created in the event
-    #  other architectures require different boot files.
-    cfg.StrOpt('pxe_bootfile_name',
-               default='pxelinux.0',
-               help='Neutron bootfile DHCP parameter.'),
-    cfg.IntOpt('image_cache_size',
-               default=1024,
-               help='Maximum size (in MiB) of cache for master images, '
-               'including those in use'),
-    cfg.IntOpt('image_cache_ttl',
-               default=60,
-               help='Maximum TTL (in minutes) for old master images in cache'),
     ]
 xcat_opts = [
     cfg.StrOpt('network_node_ip',
@@ -94,19 +46,9 @@ xcat_opts = [
     cfg.StrOpt('ssh_password',
                default='cluster',
                help='Password of neutron network node'),
-    cfg.IntOpt('ssh_session_timeout',
-               default=10,
-               help='ssh session time'),
-    cfg.FloatOpt('ssh_shell_wait',
-               default=0.5,
-               help='wait time for the ssh cmd excute'),
     cfg.IntOpt('ssh_port',
                default=22,
                help='ssh connection port for the neutron '),
-    cfg.IntOpt('ssh_buf_size',
-               default=65535,
-               help='Maximum size (in charactor) of cache for ssh, '
-               'including those in use'),
     cfg.StrOpt('host_filepath',
                default='/etc/hosts',
                help='host file of server'),
@@ -125,7 +67,7 @@ CONF.register_opts(pxe_opts, group='pxe')
 CONF.register_opts(xcat_opts, group='xcat')
 CONF.import_opt('use_ipv6', 'ironic.netconf')
 
-LAST_CMD_TIME = {}
+EM_SEMAPHORE = 'xcat_pxe'
 
 def _check_for_missing_params(info_dict, param_prefix=''):
     missing_info = []
@@ -261,9 +203,8 @@ class PXEDeploy(base.DeployInterface):
     def deploy(self, task):
         """Start deployment of the task's node'.
 
-        Fetches instance image, creates a temporary keystone token file,
-        updates the Neutron DHCP port options for next boot, and issues a
-        reboot request to the power driver.
+        Config host file and xcat dhcp, generate image info for xcat
+        and issues a  reboot request to the power driver.
         This causes the node to boot into the deployment ramdisk and triggers
         the next phase of PXE-based deployment via
         VendorPassthru._continue_deploy().
@@ -303,7 +244,8 @@ class PXEDeploy(base.DeployInterface):
 
     def prepare(self, task):
         """Prepare the deployment environment for this task's node.
-        Config the dhcp with xcat command
+        Get the image info from glance, config the mac for the xcat
+        use ssh and iptables to disable dhcp on network node
         :param task: a TaskManager instance containing the node to act on.
         """
         # TODO(deva): optimize this if rerun on existing files
@@ -392,9 +334,10 @@ class PXEDeploy(base.DeployInterface):
                         % {'xcat_node': driver_info['xcat_node'], 'error': e})
             raise exception.IPMIFailure(cmd=cmd)
 
+    @lockutils.synchronized(EM_SEMAPHORE, 'xcat-hosts-')
     def _config_host_file(self, driver_info, deploy_ip):
         """ append node and ip infomation to host file"""
-        with open(CONF.xcat.host_filepath,"r") as f:
+        with open(CONF.xcat.host_filepath,"r+") as f:
             lines = []
             for line in f:
                 temp = line.split('#')
@@ -406,11 +349,10 @@ class PXEDeploy(base.DeployInterface):
             # append a new line to host file
             line = "%s\t%s\n" %(deploy_ip,driver_info['xcat_node'])
             lines.append(line)
-
-        with open(CONF.xcat.host_filepath,"w") as f:
+            f.seek(0)
+            f.truncate()
             for line in lines:
                 f.write(line)
-
 
     def _nodeset_osimage(self, driver_info, image_name):
         """run nodeset command to config the image for the xcat node
@@ -504,7 +446,7 @@ class PXEDeploy(base.DeployInterface):
 
         if locals['errstr']:
             raise xcat_exception.xCATDeploymentFailure(locals['errstr'])
-
+        # deploy end, delete the dhcp rule for xcat
         self._ssh_delete_dhcp_rule(CONF.xcat.network_node_ip,CONF.xcat.ssh_port,CONF.xcat.ssh_user,
                                      CONF.xcat.ssh_password,i_info['network_id'],node_mac_addrsses[0])
 
